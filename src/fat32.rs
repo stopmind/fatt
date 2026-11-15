@@ -1,9 +1,11 @@
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use std::clone::Clone;
 use std::io;
 use std::io::{Read, Seek, SeekFrom};
+use std::mem::offset_of;
 use thiserror::Error;
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, Unaligned};
 use zerocopy::little_endian::{U16, U32};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, Unaligned};
 
 const BOOT_SIG: [u8; 2] = 0xAA55u16.to_le_bytes();
 const BPB32_SIG1: u8 = 0x28;
@@ -17,7 +19,7 @@ pub enum Fat32Error {
     #[error("io error: {0}")]
     IoError(#[from] io::Error),
     #[error("fs is corrupted: {0}")]
-    Corrupted(&'static str)
+    Corrupted(&'static str),
 }
 
 pub type Fat32Result<T> = Result<T, Fat32Error>;
@@ -71,7 +73,6 @@ pub struct FsInfo {
     trail_signature: U32,
 }
 
-
 pub struct Fat32<R> {
     reader: R,
 
@@ -82,12 +83,12 @@ pub struct Fat32<R> {
     fat_entries: Box<[u32]>,
     fats_count: u8,
 
-    root: u32
+    root: u32,
 }
 
 impl<R> Fat32<R>
 where
-    R: Read + Seek
+    R: Read + Seek,
 {
     pub fn new(mut reader: R) -> Fat32Result<Self> {
         use Fat32Error::*;
@@ -122,12 +123,13 @@ where
 
         let sectors_count = match bpb.total_sectors.get() {
             0 => bpb.large_sectors_count.get(),
-            v => v as u32
+            v => v as u32,
         };
         let clusters_count = sectors_count / bpb.sectors_per_cluster as u32;
 
         // read fs info
-        reader.seek_relative(bpb.sector_size.get() as i64 * (bpb.fs_info_sector.get() - 1) as i64)?;
+        reader
+            .seek_relative(bpb.sector_size.get() as i64 * (bpb.fs_info_sector.get() - 1) as i64)?;
 
         let mut lead_signature = U32::ZERO;
         reader.read_exact(lead_signature.as_mut_bytes())?;
@@ -151,7 +153,8 @@ where
         let cluster_size = bpb.sector_size.get() as u64 * bpb.sectors_per_cluster as u64;
         let fat_size = bpb.sectors_per_fat.get() as u64 * bpb.sector_size.get() as u64;
 
-        let mut fat_entries = Vec::from_fn(fat_size as usize / size_of::<u32>(), |_| 0u32).into_boxed_slice();
+        let mut fat_entries =
+            Vec::from_fn(fat_size as usize / size_of::<u32>(), |_| 0u32).into_boxed_slice();
         let reserved = bpb.reserved_sectors.get() as u64 * bpb.sector_size.get() as u64;
         reader.seek(SeekFrom::Start(reserved))?;
         reader.read_exact(fat_entries.as_mut_bytes())?;
@@ -183,19 +186,24 @@ where
         self.fat_entries[cluster as usize]
     }
 
-    pub fn read_root(&mut self) -> io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        Fat32Read::new(self, self.root, None)
-            .read_to_end(&mut buf)?;
-        Ok(buf)
+    fn read_file(&mut self, cluster: u32, len: Option<u64>) -> ReadFile<'_, R> {
+        ReadFile::new(self, cluster, len)
+    }
+
+    fn read_dir(&mut self, cluster: u32) -> ReadDir<'_, R> {
+        ReadDir::new(self.read_file(cluster, None))
+    }
+
+    pub fn read_root(&mut self) -> ReadDir<'_, R> {
+        self.read_dir(self.root)
     }
 }
 
 const FREE_CLUSTER: u32 = 0;
 const BAD_CLUSTER: u32 = 0x0FFFFFF7;
-const LAST_CLUSTER: u32 = 0x0FFFFFF8 ;
+const LAST_CLUSTER: u32 = 0x0FFFFFF8;
 
-pub struct Fat32Read<'a, R> {
+pub struct ReadFile<'a, R> {
     fs: &'a mut Fat32<R>,
     start_cluster: u32,
     current_cluster: u32,
@@ -203,13 +211,14 @@ pub struct Fat32Read<'a, R> {
 
     cluster_offset: u64,
     pos: u64,
-    len: Option<u64>
+    len: Option<u64>,
 }
 
-impl<'a, R> Fat32Read<'a, R>  {
+impl<'a, R> ReadFile<'a, R> {
     fn new(fs: &'a mut Fat32<R>, cluster: u32, len: Option<u64>) -> Self {
-        Fat32Read {
-            len, fs,
+        ReadFile {
+            len,
+            fs,
             start_cluster: cluster,
             current_cluster: cluster,
             cluster_num: 0,
@@ -225,13 +234,16 @@ impl<'a, R> Fat32Read<'a, R>  {
     }
 }
 
-impl<'a, R> Fat32Read<'a, R>
-where R: Read + Seek
+impl<'a, R> ReadFile<'a, R>
+where
+    R: Read + Seek,
 {
     /// returns true if cluster changed
     fn next_cluster(&mut self) -> io::Result<bool> {
         match self.fs.get_cluster_value(self.current_cluster) {
-            x if x == FREE_CLUSTER || x == BAD_CLUSTER => Err(io::Error::other("fat table corrupted")),
+            x if x == FREE_CLUSTER || x == BAD_CLUSTER => {
+                Err(io::Error::other("fat table corrupted"))
+            }
             LAST_CLUSTER.. => Ok(false),
             next => {
                 self.current_cluster += next;
@@ -243,8 +255,9 @@ where R: Read + Seek
     }
 }
 
-impl<'a, R> Read for Fat32Read<'a, R>
-where R: Read + Seek
+impl<'a, R> Read for ReadFile<'a, R>
+where
+    R: Read + Seek,
 {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         let mut remaining = buf.len();
@@ -255,13 +268,19 @@ where R: Read + Seek
         let mut buf_offset = 0usize;
 
         while remaining != 0 {
-            if self.cluster_offset == self.fs.cluster_size && !self.next_cluster()? { break }
+            if self.cluster_offset == self.fs.cluster_size && !self.next_cluster()? {
+                break;
+            }
 
             let to_read = remaining.min((self.fs.cluster_size - self.cluster_offset) as usize);
-            let fs_start = self.fs.clusters_start + self.fs.cluster_size * (self.current_cluster - 2) as u64 + self.cluster_offset;
+            let fs_start = self.fs.clusters_start
+                + self.fs.cluster_size * (self.current_cluster - 2) as u64
+                + self.cluster_offset;
 
             self.fs.reader.seek(SeekFrom::Start(fs_start))?;
-            self.fs.reader.read_exact(&mut buf[buf_offset..buf_offset+to_read])?;
+            self.fs
+                .reader
+                .read_exact(&mut buf[buf_offset..buf_offset + to_read])?;
 
             self.pos += to_read as u64;
             self.cluster_offset += to_read as u64;
@@ -273,22 +292,33 @@ where R: Read + Seek
     }
 }
 
-impl<'a, R> Seek for Fat32Read<'a, R>
-where R: Read + Seek
+impl<'a, R> Seek for ReadFile<'a, R>
+where
+    R: Read + Seek,
 {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new_pos = match pos {
             SeekFrom::Start(pos) => pos as i64,
             SeekFrom::End(off) => {
-                if let Some(len) = self.len { len as i64 + off }
-                else { return Err(io::Error::other("cant seek from end on reader with unknown len")) }
-            },
-            SeekFrom::Current(off) => self.pos as i64 + off
+                if let Some(len) = self.len {
+                    len as i64 + off
+                } else {
+                    return Err(io::Error::other(
+                        "cant seek from end on reader with unknown len",
+                    ));
+                }
+            }
+            SeekFrom::Current(off) => self.pos as i64 + off,
         };
 
         if new_pos < 0 {
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid seek to a negative position"))
-        } else if let Some(len) = self.len && new_pos >= len as i64 {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek to a negative position",
+            ))
+        } else if let Some(len) = self.len
+            && new_pos >= len as i64
+        {
             Err(io::Error::from(io::ErrorKind::UnexpectedEof))
         } else {
             let new_pos = new_pos as u64;
@@ -299,14 +329,14 @@ where R: Read + Seek
             if new_cluster_num > self.cluster_num {
                 for _ in self.cluster_num..new_cluster_num {
                     if !self.next_cluster()? {
-                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
                     }
                 }
             } else if new_cluster_num < self.cluster_num {
                 self.start();
                 for _ in 0..new_cluster_num {
                     if !self.next_cluster()? {
-                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
                     }
                 }
             }
@@ -319,5 +349,147 @@ where R: Read + Seek
 
     fn stream_position(&mut self) -> io::Result<u64> {
         Ok(self.pos)
+    }
+}
+
+pub struct DirEntry {
+    pub name: String,
+    pub cluster: u32,
+    pub is_dir: bool,
+    pub read_only: bool,
+    pub size: u32,
+    pub created: NaiveDateTime,
+    pub accessed: NaiveDate,
+    pub modified: NaiveDateTime,
+}
+
+pub struct ReadDir<'a, R> {
+    reader: ReadFile<'a, R>,
+    finished: bool,
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone, FromBytes, Unaligned, Immutable, IntoBytes)]
+struct Time(U16);
+
+impl Time {
+    fn parse(self) -> NaiveTime {
+        let v = self.0.get();
+        NaiveTime::from_hms_opt(
+            ((v & 0b1111_1000_0000_0000) >> 11) as u32,
+            ((v & 0b0000_0111_1110_0000) >> 5) as u32,
+            (v & 0b0000_0000_0001_1111) as u32,
+        )
+        .unwrap_or(NaiveTime::MIN)
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone, FromBytes, Unaligned, Immutable, IntoBytes)]
+struct Date(U16);
+
+impl Date {
+    fn parse(self) -> NaiveDate {
+        let v = self.0.get();
+
+        NaiveDate::from_ymd_opt(
+            ((v & 0b1111_1110_0000_0000) >> 9) as i32 + 1980,
+            ((v & 0b0000_0001_1110_0000) >> 5) as u32,
+            (v & 0b0000_0000_0001_1111) as u32,
+        )
+        .unwrap_or(NaiveDate::MIN)
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone, FromBytes, Unaligned, Immutable, IntoBytes)]
+struct Fat32DirEntry {
+    name: [u8; 11],
+    attr: u8,
+    __reserved: [u8; 2],
+    creation_time: Time,
+    creation_date: Date,
+    last_accessed_date: Date,
+    cluster_high: U16,
+    last_modification_time: Time,
+    last_modification_date: Date,
+    cluster_low: U16,
+    size: U32,
+}
+
+const _: () = const {
+    assert!(size_of::<Fat32DirEntry>() == 32);
+    assert!(offset_of!(Fat32DirEntry, cluster_low) == 26)
+};
+
+const LONG_NAME_ATTR: u8 = 0x0F;
+const DIR_ATTR: u8 = 0x10;
+const READ_ONLY_ATTR: u8 = 0x01;
+
+impl<'a, R> ReadDir<'a, R> {
+    fn new(reader: ReadFile<'a, R>) -> Self {
+        Self {
+            reader,
+            finished: false,
+        }
+    }
+}
+
+impl<'a, R> ReadDir<'a, R>
+where
+    R: Read + Seek,
+{
+    fn read_next_entry(&mut self) -> io::Result<Fat32DirEntry> {
+        let mut entry = Fat32DirEntry::new_zeroed();
+        self.reader.read_exact(entry.as_mut_bytes()).map(|_| entry)
+    }
+}
+
+impl<'a, R> Iterator for ReadDir<'a, R>
+where
+    R: Read + Seek,
+{
+    type Item = Fat32Result<DirEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        loop {
+            let entry = match self.read_next_entry() {
+                Ok(entry) => entry,
+                Err(err) => return Some(Err(err.into())),
+            };
+
+            if entry.name[0] == 0 {
+                self.finished = true;
+                return None;
+            }
+
+            if entry.attr == LONG_NAME_ATTR {
+                println!("SKIPPING LONG NAMES");
+                continue;
+            }
+
+            let cluster = (entry.cluster_high.get() as u32) << 8 | entry.cluster_low.get() as u32;
+
+            return Some(Ok(DirEntry {
+                name: String::from_utf8_lossy(&entry.name).into_owned(),
+                cluster,
+                is_dir: entry.attr & DIR_ATTR != 0,
+                read_only: entry.attr & READ_ONLY_ATTR != 0,
+                size: entry.size.get(),
+                created: NaiveDateTime::new(
+                    entry.creation_date.parse(),
+                    entry.creation_time.parse(),
+                ),
+                accessed: entry.last_accessed_date.parse(),
+                modified: NaiveDateTime::new(
+                    entry.last_modification_date.parse(),
+                    entry.last_modification_time.parse(),
+                ),
+            }));
+        }
     }
 }
