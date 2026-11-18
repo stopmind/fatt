@@ -1,11 +1,11 @@
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use std::clone::Clone;
-use std::io;
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::offset_of;
+use std::{io, iter};
 use thiserror::Error;
 use zerocopy::little_endian::{U16, U32};
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, Unaligned};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 const BOOT_SIG: [u8; 2] = 0xAA55u16.to_le_bytes();
 const BPB32_SIG1: u8 = 0x28;
@@ -363,11 +363,6 @@ pub struct DirEntry {
     pub modified: NaiveDateTime,
 }
 
-pub struct ReadDir<'a, R> {
-    reader: ReadFile<'a, R>,
-    finished: bool,
-}
-
 #[repr(C, packed)]
 #[derive(Copy, Clone, FromBytes, Unaligned, Immutable, IntoBytes)]
 struct Time(U16);
@@ -402,8 +397,8 @@ impl Date {
 }
 
 #[repr(C, packed)]
-#[derive(Copy, Clone, FromBytes, Unaligned, Immutable, IntoBytes)]
-struct Fat32DirEntry {
+#[derive(Copy, Clone, FromBytes, Unaligned, Immutable, IntoBytes, KnownLayout)]
+struct Fat32SFNEntry {
     name: [u8; 11],
     attr: u8,
     __reserved: [u8; 2],
@@ -417,31 +412,43 @@ struct Fat32DirEntry {
     size: U32,
 }
 
+#[repr(C, packed)]
+#[derive(Copy, Clone, FromBytes, Unaligned, Immutable, IntoBytes, KnownLayout)]
+struct Fat32LFNEntry {
+    seq: u8,
+    frag1: [u8; 10],
+    attr: u8,
+    __reserved: u8,
+    checksum: u8,
+    frag2: [u8; 12],
+    __reserved2: [u8; 2],
+    frag3: [u8; 4],
+}
+
 const _: () = const {
-    assert!(size_of::<Fat32DirEntry>() == 32);
-    assert!(offset_of!(Fat32DirEntry, cluster_low) == 26)
+    assert!(size_of::<Fat32SFNEntry>() == 32);
+    assert!(size_of::<Fat32LFNEntry>() == 32);
 };
 
 const LONG_NAME_ATTR: u8 = 0x0F;
 const DIR_ATTR: u8 = 0x10;
 const READ_ONLY_ATTR: u8 = 0x01;
+const ENTRY_REMOVED: u8 = 0xE5;
+const LFN_NAME_LENGTH: usize = 26;
+
+pub struct ReadDir<'a, R> {
+    reader: ReadFile<'a, R>,
+    finished: bool,
+    lfn_buffer: Vec<u8>,
+}
 
 impl<'a, R> ReadDir<'a, R> {
     fn new(reader: ReadFile<'a, R>) -> Self {
         Self {
             reader,
             finished: false,
+            lfn_buffer: Vec::new(),
         }
-    }
-}
-
-impl<'a, R> ReadDir<'a, R>
-where
-    R: Read + Seek,
-{
-    fn read_next_entry(&mut self) -> io::Result<Fat32DirEntry> {
-        let mut entry = Fat32DirEntry::new_zeroed();
-        self.reader.read_exact(entry.as_mut_bytes()).map(|_| entry)
     }
 }
 
@@ -457,25 +464,65 @@ where
         }
 
         loop {
-            let entry = match self.read_next_entry() {
-                Ok(entry) => entry,
-                Err(err) => return Some(Err(err.into())),
-            };
+            let mut entry = [0; 32];
+            if let Err(err) = self.reader.read_exact(&mut entry) {
+                return Some(Err(err.into()));
+            }
 
-            if entry.name[0] == 0 {
+            if entry[0] == 0 || entry[0] == ENTRY_REMOVED {
                 self.finished = true;
                 return None;
             }
 
-            if entry.attr == LONG_NAME_ATTR {
-                println!("SKIPPING LONG NAMES");
+            if entry[offset_of!(Fat32SFNEntry, attr)] == LONG_NAME_ATTR {
+                let entry = Fat32LFNEntry::ref_from_bytes(&entry)
+                    .expect("Fat32LFNEntry size must be 32 bytes");
+
+                let order = 0b00011111 & entry.seq;
+                let end = order as usize * LFN_NAME_LENGTH;
+                if self.lfn_buffer.len() < end {
+                    self.lfn_buffer
+                        .extend(iter::repeat_n(0, end - self.lfn_buffer.len()))
+                }
+
+                let frag = &mut self.lfn_buffer[end - LFN_NAME_LENGTH..end];
+                frag[0..10].copy_from_slice(&entry.frag1);
+                frag[10..22].copy_from_slice(&entry.frag2);
+                frag[22..26].copy_from_slice(&entry.frag3);
                 continue;
             }
 
+            let entry =
+                Fat32SFNEntry::ref_from_bytes(&entry).expect("Fat32SFNEntry size must be 32 bytes");
+
             let cluster = (entry.cluster_high.get() as u32) << 8 | entry.cluster_low.get() as u32;
 
+            let name = if self.lfn_buffer.is_empty() {
+                let name = String::from_utf8_lossy(&entry.name[..8]);
+                let ext = String::from_utf8_lossy(&entry.name[8..]);
+                let name = name.trim();
+                let ext = ext.trim();
+
+                if ext.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{name}.{ext}")
+                }
+            } else {
+                let end = self
+                    .lfn_buffer
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .position(|c| *c == [0; 2])
+                    .map(|x| x * 2)
+                    .unwrap_or(self.lfn_buffer.len());
+
+                String::from_utf16le_lossy(&self.lfn_buffer[0..end])
+            };
+
             return Some(Ok(DirEntry {
-                name: String::from_utf8_lossy(&entry.name).into_owned(),
+                name,
                 cluster,
                 is_dir: entry.attr & DIR_ATTR != 0,
                 read_only: entry.attr & READ_ONLY_ATTR != 0,
